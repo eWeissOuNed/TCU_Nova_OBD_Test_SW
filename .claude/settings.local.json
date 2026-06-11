@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Start-Process \"ms-settings:appsfeatures-app\")"
+    ]
+  }
+}
