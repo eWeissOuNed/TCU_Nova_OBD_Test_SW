@@ -1,4 +1,0 @@
--march=rv32imac_zicsr_zifencei_zaamo_zalrsc
--mtune=esp-base
-"-specs=C:/Users/dominik.keller/Documents/GitRepos/TCU_NOVA_OBD_Test_SW/build/specs/picolibc.specs"
--fno-rtti
