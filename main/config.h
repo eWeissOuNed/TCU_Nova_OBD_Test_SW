@@ -32,8 +32,11 @@
 #define CFG_IMU_CLOCK_HZ     1000000
 
 /* ── SD Card (via SPI) ───────────────────────────────────────────────────── *
- *  TODO: confirm CS pin on actual PCB                                       */
-#define CFG_SD_CS            GPIO_NUM_7    /* TBD – verify on schematic */
+ *  Enable pin: GPIO7, active-low (pull-up on board → high-Z = disabled)    *
+ *  CS:         GPIO24                                                        */
+#define CFG_SD_EN_GPIO       GPIO_NUM_7
+#define CFG_SD_CS            GPIO_NUM_24
+#define CFG_SD_MOUNT         "/sdcard"
 
 /* ── UWB module (DWM3000) ────────────────────────────────────────────────── *
  *  TODO: confirm pins on actual PCB                                         */

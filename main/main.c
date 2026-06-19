@@ -54,7 +54,7 @@ void app_main(void)
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(CFG_SPI_HOST, &bus_cfg, SPI_DMA_DISABLED));
+    ESP_ERROR_CHECK(spi_bus_initialize(CFG_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
 
     /* ── Peripherals ── */
     ESP_ERROR_CHECK(led_init());

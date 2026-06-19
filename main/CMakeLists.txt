@@ -18,6 +18,7 @@ idf_component_register(
         esp_driver_gpio
         esp_driver_uart
         esp_timer
-        # esp_vfs_fat  ← add back when SD card is implemented
-        # sdmmc        ← add back when SD card is implemented
+        fatfs
+        sdmmc
+        esp_driver_sdspi
 )

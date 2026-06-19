@@ -106,7 +106,7 @@ static void handle_line(char *line)
                "  LED OFF\n"
                "  CAN SEND <id_hex> <data_hex_bytes…>\n"
                "  CAN STREAM <ON|OFF>\n"
-               "  SD INIT | SD LIST\n"
+               "  SD INIT | SD LIST | SD WRITE <msg> | SD READ | SD WIPE | SD EN <ON|OFF>\n"
                "  UWB INIT | UWB RANGE\n"
                "  MODEM AT <command>\n"
                "  SLEEP\n",
@@ -192,8 +192,39 @@ static void handle_line(char *line)
             esp_err_t e = sdcard_list(buf, sizeof(buf));
             if (e == ESP_OK) resp_ok(buf);
             else resp_err(esp_err_to_name(e));
+        } else if (strcmp(tok[1], "WRITE") == 0) {
+            /* SD WRITE <message words...> */
+            char msg[96] = "(no message)";
+            if (ntok >= 3) {
+                msg[0] = '\0';
+                for (int i = 2; i < ntok; i++) {
+                    if (i > 2) strncat(msg, " ", sizeof(msg) - strlen(msg) - 1);
+                    strncat(msg, tok[i], sizeof(msg) - strlen(msg) - 1);
+                }
+            }
+            esp_err_t e = sdcard_write(msg);
+            if (e == ESP_OK) resp_ok("line written");
+            else resp_err(esp_err_to_name(e));
+        } else if (strcmp(tok[1], "READ") == 0) {
+            char buf[1024];
+            esp_err_t e = sdcard_read(buf, sizeof(buf));
+            /* print line by line so long files don't get cut off */
+            if (e == ESP_OK || e == ESP_ERR_NOT_FOUND) {
+                printf("OK\n%s\n", buf);
+                fflush(stdout);
+            } else {
+                resp_err(esp_err_to_name(e));
+            }
+        } else if (strcmp(tok[1], "WIPE") == 0) {
+            esp_err_t e = sdcard_wipe();
+            if (e == ESP_OK) resp_ok("TEST.TXT deleted");
+            else resp_err(esp_err_to_name(e));
+        } else if (strcmp(tok[1], "EN") == 0 && ntok >= 3) {
+            bool on = strcmp(tok[2], "ON") == 0;
+            sdcard_set_enable(on);
+            resp_ok(on ? "EN → LOW (card on)" : "EN → HIGH-Z (card off)");
         } else {
-            resp_err("unknown SD command");
+            resp_err("SD: INIT | LIST | WRITE <msg> | READ | WIPE | EN <ON|OFF>");
         }
 
     /* ── UWB ── */
