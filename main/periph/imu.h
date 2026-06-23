@@ -3,7 +3,8 @@
 #include "esp_err.h"
 
 typedef struct {
-    float ax_g, ay_g, az_g;   /* acceleration in g */
+    float ax_g,  ay_g,  az_g;   /* acceleration  in g      */
+    float gx_dps, gy_dps, gz_dps; /* angular rate  in °/s  */
 } imu_data_t;
 
 /** Initialise SPI bus and LSM6DSOTR. Call once after spi_bus_initialize(). */
