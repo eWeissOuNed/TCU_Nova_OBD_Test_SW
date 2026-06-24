@@ -33,23 +33,26 @@
 
 /* ── SD Card (via SPI) ───────────────────────────────────────────────────── *
  *  Enable pin: GPIO7, active-low (pull-up on board → high-Z = disabled)    *
- *  CS:         GPIO24                                                        */
+ *  CS:         GPIO24                                                        *
+ *  Card-detect switch: GPIO8, active-low (card inserted = LOW)             */
 #define CFG_SD_EN_GPIO       GPIO_NUM_7
 #define CFG_SD_CS            GPIO_NUM_24
+#define CFG_SD_DET           GPIO_NUM_8   /* card-insert switch, active-low */
 #define CFG_SD_MOUNT         "/sdcard"
 
 /* ── UWB module (DWM3000) ────────────────────────────────────────────────── *
  *  TODO: confirm pins on actual PCB                                         */
-#define CFG_UWB_CS           GPIO_NUM_8    /* TBD */
-#define CFG_UWB_IRQ          GPIO_NUM_9    /* TBD */
+#define CFG_UWB_CS           GPIO_NUM_9
+#define CFG_UWB_IRQ          GPIO_NUM_NC   /* TBD */
 #define CFG_UWB_RST          GPIO_NUM_NC   /* TBD */
 #define CFG_UWB_CLOCK_HZ     8000000
 
-/* ── Modem (Quectel EG915, UART) ─────────────────────────────────────────── *
- *  TODO: confirm UART pins on actual PCB                                    *
+/* ── Modem (Quectel EG915N-EU, UART) ────────────────────────────────────── *
  *  Note: UART0 is the console (GPIO11/12). Use UART1 for modem.            */
 #define CFG_MODEM_UART       UART_NUM_1
-#define CFG_MODEM_TX         GPIO_NUM_6    /* TBD */
-#define CFG_MODEM_RX         GPIO_NUM_NC   /* TBD */
+#define CFG_MODEM_TX         GPIO_NUM_23
+#define CFG_MODEM_RX         GPIO_NUM_15
+#define CFG_MODEM_PWRKEY     GPIO_NUM_1    /* open-drain, pulse LOW ≥600ms to power on */
+#define CFG_MODEM_RST        GPIO_NUM_NC   /* TBD – not wired yet */
 #define CFG_MODEM_BAUD       115200
 #define CFG_MODEM_BUF_SIZE   1024

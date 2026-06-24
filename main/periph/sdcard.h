@@ -12,6 +12,9 @@ esp_err_t sdcard_deinit(void);
 /** Returns true if the card is currently mounted. */
 bool      sdcard_is_mounted(void);
 
+/** Returns true if a card is physically inserted (reads DET pin, active-low). */
+bool      sdcard_is_inserted(void);
+
 /** Fill buf with a newline-separated directory listing of the root folder. */
 esp_err_t sdcard_list(char *buf, size_t buf_len);
 

@@ -3,6 +3,7 @@
 #include "periph/led.h"
 #include "periph/can_bus.h"
 #include "periph/sdcard.h"
+#include "periph/gpio_cmd.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
@@ -31,6 +32,7 @@ static void on_enter(app_state_t s)
 
     case STATE_SLEEP:
         ESP_LOGI(TAG, "→ SLEEP (deep sleep in 500 ms)");
+        gpio_cmd_toggle_stop_all();  /* stop any active GPIO toggles */
         sdcard_deinit();       /* unmount + EN pin high-Z before power off */
         led_shutdown();
         vTaskDelay(pdMS_TO_TICKS(400));

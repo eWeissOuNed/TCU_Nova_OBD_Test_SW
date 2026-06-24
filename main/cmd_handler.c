@@ -9,22 +9,32 @@
  *
  * Commands
  * ────────
- *   PING                      → OK PONG
- *   HELP                      → OK <command list>
- *   STATE?                    → OK <state name>
- *   STATE SET <name>          → OK | ERR
- *   IMU?                      → OK ax=X ay=Y az=Z
- *   IMU STREAM ON|OFF         → OK
- *   LED <idx> <r> <g> <b>     → OK | ERR
- *   LED OFF                   → OK
- *   CAN SEND <id_hex> <hex…>  → OK | ERR
- *   CAN STREAM ON|OFF         → OK
- *   SD INIT                   → OK | ERR
- *   SD LIST                   → OK <files> | ERR
- *   UWB INIT                  → OK | ERR
- *   UWB RANGE                 → OK <mm> | ERR
- *   MODEM AT <command>        → OK <response> | ERR
- *   SLEEP                     → (device sleeps)
+ *   PING                          → OK PONG
+ *   HELP                          → OK <command list>
+ *   STATE?                        → OK <state name>
+ *   STATE SET <name>              → OK | ERR
+ *   IMU?                          → OK ax=X ay=Y az=Z gx=X gy=Y gz=Z
+ *   IMU STREAM ON|OFF             → OK
+ *   LED <idx> <r> <g> <b>         → OK | ERR
+ *   LED OFF                       → OK
+ *   CAN SEND <id_hex> <hex…>      → OK | ERR
+ *   CAN STREAM ON|OFF             → OK
+ *   SD INIT                       → OK | ERR
+ *   SD LIST                       → OK <files> | ERR
+ *   SD WRITE <msg>                → OK | ERR
+ *   SD READ                       → OK <content> | ERR
+ *   SD WIPE                       → OK | ERR
+ *   SD EN ON|OFF                  → OK
+ *   GPIO SET <pin> HIGH|LOW       → OK | ERR
+ *   GPIO GET <pin>                → OK HIGH|LOW | ERR
+ *   GPIO TOGGLE <pin> <freq_hz>   → OK | ERR
+ *   GPIO TOGGLE <pin> STOP        → OK | ERR
+ *   GPIO STOP ALL                 → OK
+ *   UWB INIT                      → OK | ERR
+ *   UWB READ ID                   → OK 0xDECA0302 | ERR
+ *   UWB RANGE                     → OK <mm> | ERR
+ *   MODEM AT <command>            → OK <response> | ERR
+ *   SLEEP                         → (device sleeps)
  */
 #include "cmd_handler.h"
 #include "config.h"
@@ -35,12 +45,14 @@
 #include "periph/sdcard.h"
 #include "periph/uwb.h"
 #include "periph/modem.h"
+#include "periph/gpio_cmd.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 #define CMD_LINE_MAX 128
 #define PROMPT       "\r\n> "
@@ -98,16 +110,15 @@ static void handle_line(char *line)
     } else if (strcmp(tok[0], "HELP") == 0) {
         printf("OK Commands:\n"
                "  PING\n"
-               "  STATE?\n"
-               "  STATE SET <IDLE|SLEEP|TEST_RUNNING>\n"
-               "  IMU?\n"
-               "  IMU STREAM <ON|OFF>\n"
-               "  LED <idx 0-%d> <r> <g> <b>\n"
-               "  LED OFF\n"
-               "  CAN SEND <id_hex> <data_hex_bytes…>\n"
-               "  CAN STREAM <ON|OFF>\n"
+               "  STATE? | STATE SET <IDLE|SLEEP|TEST_RUNNING>\n"
+               "  IMU? | IMU STREAM <ON|OFF>\n"
+               "  LED <idx 0-%d> <r> <g> <b> | LED OFF\n"
+               "  CAN SEND <id_hex> <data_hex_bytes…> | CAN STREAM <ON|OFF>\n"
                "  SD INIT | SD LIST | SD WRITE <msg> | SD READ | SD WIPE | SD EN <ON|OFF>\n"
-               "  UWB INIT | UWB RANGE\n"
+               "  GPIO SET <pin> <HIGH|LOW>\n"
+               "  GPIO GET <pin>\n"
+               "  GPIO TOGGLE <pin> <freq_hz> | GPIO TOGGLE <pin> STOP | GPIO STOP ALL\n"
+               "  UWB INIT | UWB READ ID | UWB RANGE\n"
                "  MODEM AT <command>\n"
                "  SLEEP\n",
                CFG_LED_COUNT - 1);
@@ -223,8 +234,54 @@ static void handle_line(char *line)
             bool on = strcmp(tok[2], "ON") == 0;
             sdcard_set_enable(on);
             resp_ok(on ? "EN → LOW (card on)" : "EN → HIGH-Z (card off)");
+        } else if (strcmp(tok[1], "DET") == 0) {
+            resp_ok(sdcard_is_inserted() ? "INSERTED" : "EMPTY");
         } else {
-            resp_err("SD: INIT | LIST | WRITE <msg> | READ | WIPE | EN <ON|OFF>");
+            resp_err("SD: INIT | LIST | WRITE <msg> | READ | WIPE | EN <ON|OFF> | DET");
+        }
+
+    /* ── GPIO ── */
+    } else if (strcmp(tok[0], "GPIO") == 0 && ntok >= 2) {
+
+        if (strcmp(tok[1], "SET") == 0 && ntok >= 4) {
+            /* GPIO SET <pin> HIGH|LOW */
+            int pin  = atoi(tok[2]);
+            bool high = strcmp(tok[3], "HIGH") == 0;
+            esp_err_t e = gpio_cmd_set(pin, high);
+            if (e == ESP_OK) resp_ok(high ? "HIGH" : "LOW");
+            else resp_err(esp_err_to_name(e));
+
+        } else if (strcmp(tok[1], "GET") == 0 && ntok >= 3) {
+            /* GPIO GET <pin> */
+            int pin = atoi(tok[2]);
+            bool level;
+            esp_err_t e = gpio_cmd_get(pin, &level);
+            if (e == ESP_OK) resp_ok(level ? "HIGH" : "LOW");
+            else resp_err(esp_err_to_name(e));
+
+        } else if (strcmp(tok[1], "TOGGLE") == 0 && ntok >= 4) {
+            int pin = atoi(tok[2]);
+            if (strcmp(tok[3], "STOP") == 0) {
+                /* GPIO TOGGLE <pin> STOP */
+                gpio_cmd_toggle_stop(pin);   /* ignore NOT_FOUND */
+                resp_ok(NULL);
+            } else {
+                /* GPIO TOGGLE <pin> <freq_hz> */
+                uint32_t freq = (uint32_t)atoi(tok[3]);
+                esp_err_t e = gpio_cmd_toggle(pin, freq);
+                if (e == ESP_OK) resp_ok(NULL);
+                else resp_err(esp_err_to_name(e));
+            }
+
+        } else if (strcmp(tok[1], "STOP") == 0 && ntok >= 3 &&
+                   strcmp(tok[2], "ALL") == 0) {
+            /* GPIO STOP ALL */
+            gpio_cmd_toggle_stop_all();
+            resp_ok(NULL);
+
+        } else {
+            resp_err("GPIO: SET <pin> HIGH|LOW | GET <pin> | "
+                     "TOGGLE <pin> <freq_hz>|STOP | STOP ALL");
         }
 
     /* ── UWB ── */
@@ -233,6 +290,20 @@ static void handle_line(char *line)
             esp_err_t e = uwb_init();
             if (e == ESP_OK) resp_ok(NULL);
             else resp_err(esp_err_to_name(e));
+
+        } else if (strcmp(tok[1], "READ") == 0 && ntok >= 3 &&
+                   strcmp(tok[2], "ID") == 0) {
+            /* UWB READ ID */
+            uint32_t dev_id = 0;
+            esp_err_t e = uwb_read_id(&dev_id);
+            if (e == ESP_OK) {
+                char buf[20];
+                snprintf(buf, sizeof(buf), "0x%08"PRIX32, dev_id);
+                resp_ok(buf);
+            } else {
+                resp_err(esp_err_to_name(e));
+            }
+
         } else if (strcmp(tok[1], "RANGE") == 0) {
             uint32_t mm;
             esp_err_t e = uwb_range(&mm);
@@ -244,21 +315,38 @@ static void handle_line(char *line)
                 resp_err(esp_err_to_name(e));
             }
         } else {
-            resp_err("unknown UWB command");
+            resp_err("UWB: INIT | READ ID | RANGE");
         }
 
-    /* ── MODEM AT ── */
-    } else if (strcmp(tok[0], "MODEM") == 0 && ntok >= 3 &&
-               strcmp(tok[1], "AT") == 0) {
-        /* rebuild AT command from remaining tokens */
-        char at_cmd[64] = "AT";
-        for (int i = 2; i < ntok; i++) {
-            strncat(at_cmd, tok[i], sizeof(at_cmd) - strlen(at_cmd) - 1);
+    /* ── MODEM ── */
+    } else if (strcmp(tok[0], "MODEM") == 0 && ntok >= 2) {
+
+        if (strcmp(tok[1], "POWER") == 0 && ntok >= 3 &&
+                   strcmp(tok[2], "ON") == 0) {
+            esp_err_t e = modem_power_on(10000);
+            if (e == ESP_OK) resp_ok("RDY received");
+            else resp_err("RDY timeout – check wiring");
+
+        } else if (strcmp(tok[1], "POWER") == 0 && ntok >= 3 &&
+                   strcmp(tok[2], "OFF") == 0) {
+            esp_err_t e = modem_power_off();
+            if (e == ESP_OK) resp_ok(NULL);
+            else resp_err(esp_err_to_name(e));
+
+        } else if (strcmp(tok[1], "AT") == 0 && ntok >= 3) {
+            /* rebuild AT command from remaining tokens */
+            char at_cmd[64] = "AT";
+            for (int i = 2; i < ntok; i++) {
+                strncat(at_cmd, tok[i], sizeof(at_cmd) - strlen(at_cmd) - 1);
+            }
+            char resp[256];
+            esp_err_t e = modem_at(at_cmd, resp, sizeof(resp), 5000);
+            if (e == ESP_OK) resp_ok(resp);
+            else resp_err(esp_err_to_name(e));
+
+        } else {
+            resp_err("MODEM: POWER ON | POWER OFF | AT <command>");
         }
-        char resp[256];
-        esp_err_t e = modem_at(at_cmd, resp, sizeof(resp), 5000);
-        if (e == ESP_OK) resp_ok(resp);
-        else resp_err(esp_err_to_name(e));
 
     /* ── SLEEP ── */
     } else if (strcmp(tok[0], "SLEEP") == 0) {

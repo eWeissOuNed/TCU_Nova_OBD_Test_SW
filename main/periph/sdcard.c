@@ -17,6 +17,19 @@ static const char    *TAG    = "SDCARD";
 static sdmmc_card_t  *s_card = NULL;
 static bool           s_mounted = false;
 
+/* ── card-detect pin ─────────────────────────────────────────────────────── */
+static void sd_det_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << CFG_SD_DET,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,   /* switch pulls to GND when inserted */
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+}
+
 /* ── enable pin helpers ──────────────────────────────────────────────────── */
 static void sd_power(bool on)
 {
@@ -38,11 +51,23 @@ static void sd_power(bool on)
 }
 
 /* ── public API ──────────────────────────────────────────────────────────── */
+bool sdcard_is_inserted(void)
+{
+    sd_det_init();   /* safe to call repeatedly – gpio_config is idempotent */
+    return gpio_get_level(CFG_SD_DET) == 0;   /* active-low */
+}
+
 esp_err_t sdcard_init(void)
 {
     if (s_mounted) {
         ESP_LOGW(TAG, "already mounted");
         return ESP_OK;
+    }
+
+    sd_det_init();
+    if (!sdcard_is_inserted()) {
+        ESP_LOGW(TAG, "no card detected (DET pin HIGH)");
+        return ESP_ERR_NOT_FOUND;
     }
 
     sd_power(true);                   /* always pull EN low before init */
@@ -90,6 +115,10 @@ esp_err_t sdcard_deinit(void)
 
 esp_err_t sdcard_write(const char *msg)
 {
+    if (!sdcard_is_inserted()) {
+        ESP_LOGW(TAG, "write aborted – no card inserted");
+        return ESP_ERR_NOT_FOUND;
+    }
     if (!s_mounted) return ESP_ERR_INVALID_STATE;
 
     static uint32_t seq = 0;
@@ -107,6 +136,10 @@ esp_err_t sdcard_write(const char *msg)
 
 esp_err_t sdcard_read(char *buf, size_t buf_len)
 {
+    if (!sdcard_is_inserted()) {
+        ESP_LOGW(TAG, "read aborted – no card inserted");
+        return ESP_ERR_NOT_FOUND;
+    }
     if (!s_mounted) return ESP_ERR_INVALID_STATE;
 
     FILE *f = fopen(TEST_FILE, "r");
@@ -126,6 +159,10 @@ esp_err_t sdcard_read(char *buf, size_t buf_len)
 
 esp_err_t sdcard_wipe(void)
 {
+    if (!sdcard_is_inserted()) {
+        ESP_LOGW(TAG, "wipe aborted – no card inserted");
+        return ESP_ERR_NOT_FOUND;
+    }
     if (!s_mounted) return ESP_ERR_INVALID_STATE;
     if (remove(TEST_FILE) != 0) {
         ESP_LOGW(TAG, "wipe: file not found");
@@ -147,6 +184,12 @@ bool sdcard_is_mounted(void)
 
 esp_err_t sdcard_list(char *buf, size_t buf_len)
 {
+    if (!sdcard_is_inserted()) {
+        ESP_LOGW(TAG, "list aborted – no card inserted");
+        strncpy(buf, "(no card inserted)", buf_len - 1);
+        buf[buf_len - 1] = '\0';
+        return ESP_ERR_NOT_FOUND;
+    }
     if (!s_mounted) {
         strncpy(buf, "(not mounted)", buf_len - 1);
         buf[buf_len - 1] = '\0';

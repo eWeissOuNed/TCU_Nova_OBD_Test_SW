@@ -9,6 +9,7 @@ idf_component_register(
         "periph/sdcard.c"
         "periph/uwb.c"
         "periph/modem.c"
+        "periph/gpio_cmd.c"
     INCLUDE_DIRS
         "."
     REQUIRES
