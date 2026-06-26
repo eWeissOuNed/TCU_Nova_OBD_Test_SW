@@ -111,6 +111,11 @@ static esp_err_t uart_wait_for(const char *needle, uint32_t timeout_ms,
             }
         }
     }
+    /* Timeout: still copy whatever was received so caller can inspect it */
+    if (out_buf && out_len > 0 && filled > 0) {
+        strncpy(out_buf, buf, out_len - 1);
+        out_buf[out_len - 1] = '\0';
+    }
     return ESP_ERR_TIMEOUT;
 }
 
@@ -287,12 +292,10 @@ esp_err_t modem_gnss_read(char *out_buf, size_t out_len)
     char buf[256];
     /* Format 2 = decimal degrees: +QGPSLOC: <utc>,<lat>,<lon>,<hdop>,<alt>,... */
     uart_write_bytes(CFG_MODEM_UART, "AT+QGPSLOC=2\r\n", 14);
-    /* Wait for either OK or ERROR – whichever comes first */
-    esp_err_t ret = uart_wait_for("OK", 5000, buf, sizeof(buf));
+    /* Response is immediate (OK+data or +CME ERROR). 2 s is generous. */
+    esp_err_t ret = uart_wait_for("OK", 2000, buf, sizeof(buf));
     if (ret != ESP_OK) {
-        /* Re-read any pending bytes to catch the CME ERROR response */
-        uart_read_bytes(CFG_MODEM_UART, (uint8_t *)(buf + strlen(buf)),
-                        sizeof(buf) - strlen(buf) - 1, pdMS_TO_TICKS(500));
+        /* buf already contains the received bytes (populated on timeout too) */
         /* +CME ERROR: 516 = not fixed yet, 505 = GNSS not enabled */
         if (strstr(buf, "516")) {
             strncpy(out_buf, "no fix yet – needs sky view", out_len - 1);
@@ -313,10 +316,16 @@ esp_err_t modem_gnss_read(char *out_buf, size_t out_len)
         return ESP_FAIL;
     }
 
-    char utc[16], lat[16], lon[16], alt[12];
-    if (sscanf(p, "+QGPSLOC: %15[^,],%15[^,],%15[^,],%*[^,],%11[^,\r\n]",
+    char utc[16], lat[16], lon[16], alt[12], nsat[8] = "0";
+    if (sscanf(p, "+QGPSLOC: %15[^,],%15[^,],%15[^,],%*[^,],%11[^,]",
                utc, lat, lon, alt) >= 3) {
-        snprintf(out_buf, out_len, "lat=%s lon=%s alt=%sm utc=%s", lat, lon, alt, utc);
+        /* nsat is the 11th comma-delimited field after "+QGPSLOC: " */
+        char *q = p;
+        int   commas = 0;
+        while (*q && commas < 10) { if (*q++ == ',') commas++; }
+        if (commas == 10) sscanf(q, "%7[^,\r\n ]", nsat);
+        snprintf(out_buf, out_len, "lat=%s lon=%s alt=%sm sats=%s utc=%s",
+                 lat, lon, alt, nsat, utc);
     } else {
         strncpy(out_buf, p, out_len - 1);
         out_buf[out_len - 1] = '\0';
@@ -362,6 +371,7 @@ static void modem_stream_task(void *arg)
             int  rssi = 0, rsrp = 0, sinr = 0, rsrq = 0;
             char detail[128] = "";
             char gps_str[32] = "no_fix";
+            int  sats = 0;
 
             /* Signal */
             if (modem_signal(&rssi, detail, sizeof(detail)) == ESP_OK) {
@@ -377,12 +387,16 @@ static void modem_stream_task(void *arg)
             char pos[96];
             if (modem_gnss_read(pos, sizeof(pos)) == ESP_OK) {
                 float lat = 0.0f, lon = 0.0f;
-                if (sscanf(pos, "lat=%f lon=%f", &lat, &lon) == 2)
+                if (sscanf(pos, "lat=%f lon=%f", &lat, &lon) == 2) {
+                    char sats_str[8] = "0";
+                    sscanf(pos, "lat=%*s lon=%*s alt=%*s sats=%7s", sats_str);
+                    sats = atoi(sats_str);
                     snprintf(gps_str, sizeof(gps_str), "%.6f,%.6f", lat, lon);
+                }
             }
 
-            printf("MS rssi=%d rsrp=%d sinr=%d rsrq=%d gps=%s\n",
-                   rssi, rsrp, sinr, rsrq, gps_str);
+            printf("MS rssi=%d rsrp=%d sinr=%d rsrq=%d gps=%s sats=%d\n",
+                   rssi, rsrp, sinr, rsrq, gps_str, sats);
             fflush(stdout);
         }
 

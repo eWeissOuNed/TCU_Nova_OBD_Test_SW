@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TCU NOVA OBD – Serial GUI
-Deps:   pip install pyserial matplotlib
+Deps:   pip install pyserial matplotlib tkintermapview
 Usage:  python serial_gui.py [PORT] [BAUD]
 """
 import sys
@@ -16,6 +16,12 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+try:
+    import tkintermapview
+    HAS_MAP = True
+except ImportError:
+    HAS_MAP = False
 
 BAUD_DEFAULT   = 115200
 IMU_WINDOW     = 200
@@ -46,7 +52,11 @@ TAG_COLOURS = {
 }
 
 MODEM_RE = re.compile(
-    r"MS rssi=([+-]?\d+) rsrp=([+-]?\d+) sinr=([+-]?\d+) rsrq=([+-]?\d+) gps=(.+)"
+    r"MS rssi=([+-]?\d+) rsrp=([+-]?\d+) sinr=([+-]?\d+) rsrq=([+-]?\d+) gps=(\S+) sats=(\d+)"
+)
+# Matches manual GNSS READ response: OK lat=47.28420 lon= 7.70853 alt=… sats=11 …
+GNSS_READ_RE = re.compile(
+    r"lat=\s*([+-]?\d+\.\d+)\s+lon=\s*([+-]?\d+\.\d+).*?sats=(\d+)"
 )
 
 IMU_RE = re.compile(
@@ -131,7 +141,13 @@ class SerialGUI:
         self._modem_sinr: collections.deque = collections.deque(maxlen=MODEM_WINDOW)
         self._modem_active = False
         self._modem_plot_job = None
-        self._gps_str = "–"
+        self._gps_str  = "–"
+        self._gps_lat  = None
+        self._gps_lon  = None
+        self._gps_sats = 0
+        self._map_marker = None
+        self._map_path   = None
+        self._gps_track: list = []   # [(lat, lon), …]
 
         self._build_menubar()
         self._build_topbar()
@@ -238,6 +254,8 @@ class SerialGUI:
         m.add_separator()
         m.add_command(label="IMU graph ON",  command=self._show_graph)
         m.add_command(label="IMU graph OFF", command=self._hide_graph)
+        m.add_separator()
+        m.add_command(label="GPS Map",       command=self._show_gps_tab)
 
     # ── Dialogs ───────────────────────────────────────────────────────────────
     def _dlg_can_send(self):
@@ -394,6 +412,10 @@ class SerialGUI:
         self._notebook.add(self._modem_frame, text=" Modem ")
         self._build_modem_graph(self._modem_frame)
 
+        self._gps_frame = tk.Frame(self._notebook, bg=BG2)
+        self._notebook.add(self._gps_frame, text=" GPS Map ")
+        self._build_gps_tab(self._gps_frame)
+
     def _build_imu_graph(self, parent):
         fig = Figure(figsize=(4, 3), dpi=90, facecolor=PLOT_BG)
         self._ax_plot = fig.add_subplot(111, facecolor=PLOT_BG)
@@ -425,7 +447,7 @@ class SerialGUI:
         ax.set_xlabel("samples", color=FG, fontsize=8)
         self._line_rssi, = ax.plot([], [], color="#4fc1ff", lw=1.2, label="RSSI")
         self._line_rsrp, = ax.plot([], [], color="#ce9178", lw=1.2, label="RSRP")
-        self._line_sinr, = ax.plot([], [], color="#4ec94e", lw=1.2, label="SINR×2")
+        self._line_sinr, = ax.plot([], [], color="#4ec94e", lw=1.2, label="SINR (dB)")
         ax.legend(fontsize=8, loc="upper right",
                   facecolor=BG3, edgecolor="#444", labelcolor=FG)
         fig.tight_layout(pad=1.2)
@@ -436,6 +458,86 @@ class SerialGUI:
         self._gps_label = tk.Label(parent, text="GPS: –", bg=BG2, fg=FG_DIM,
                                     font=FONT_SM, anchor="w")
         self._gps_label.pack(fill=tk.X, padx=6, pady=(0, 4))
+
+    def _build_gps_tab(self, parent):
+        # ── Info bar ──────────────────────────────────────────────────────────
+        info = tk.Frame(parent, bg=BG2, pady=4)
+        info.pack(fill=tk.X, padx=6)
+
+        tk.Label(info, text="Satellites:", bg=BG2, fg=FG_DIM,
+                 font=FONT_SM).pack(side=tk.LEFT)
+        self._sats_lbl = tk.Label(info, text="–", bg=BG3, fg=FG_DIM,
+                                   font=FONT_BOLD, width=4, padx=6,
+                                   relief=tk.FLAT)
+        self._sats_lbl.pack(side=tk.LEFT, padx=(2, 14))
+
+        tk.Label(info, text="Position:", bg=BG2, fg=FG_DIM,
+                 font=FONT_SM).pack(side=tk.LEFT)
+        self._coords_lbl = tk.Label(info, text="–", bg=BG2, fg=FG,
+                                     font=FONT_SM)
+        self._coords_lbl.pack(side=tk.LEFT, padx=(4, 0))
+
+        styled_btn(info, "Clear track", self._clear_track,
+                   padx=8).pack(side=tk.RIGHT, padx=4)
+
+        # ── Map area ──────────────────────────────────────────────────────────
+        if HAS_MAP:
+            self._map_widget = tkintermapview.TkinterMapView(
+                parent, width=420, height=320, corner_radius=0)
+            self._map_widget.pack(fill=tk.BOTH, expand=True)
+            self._map_widget.set_tile_server(
+                "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png")
+            self._map_widget.set_position(47.0, 8.0)  # Switzerland default
+            self._map_widget.set_zoom(7)
+        else:
+            tk.Label(parent,
+                     text="Map not available.\nInstall: pip install tkintermapview",
+                     bg=BG2, fg=FG_DIM, font=FONT, justify=tk.CENTER
+                     ).pack(expand=True)
+
+    def _update_gps_display(self, lat: float, lon: float, sats: int):
+        self._gps_lat  = lat
+        self._gps_lon  = lon
+        self._gps_sats = sats
+
+        # Colour the sat count: green ≥4, yellow 1-3, red 0
+        if sats >= 4:
+            sat_fg = GREEN
+        elif sats > 0:
+            sat_fg = "#dcdcaa"
+        else:
+            sat_fg = RED
+        self._sats_lbl.config(text=str(sats), fg=sat_fg)
+        self._coords_lbl.config(
+            text=f"lat={lat:.5f}   lon={lon:.5f}")
+
+        if HAS_MAP and hasattr(self, "_map_widget"):
+            # Accumulate track points (skip duplicates)
+            if not self._gps_track or self._gps_track[-1] != (lat, lon):
+                self._gps_track.append((lat, lon))
+
+            # Update current-position marker
+            if self._map_marker:
+                self._map_marker.delete()
+            self._map_marker = self._map_widget.set_marker(
+                lat, lon, text=f"{sats} sats")
+
+            # Draw/redraw track path (needs ≥2 points)
+            if len(self._gps_track) >= 2:
+                if self._map_path:
+                    self._map_path.delete()
+                self._map_path = self._map_widget.set_path(
+                    self._gps_track,
+                    color="#4fc1ff", width=3)
+
+            self._map_widget.set_position(lat, lon)
+
+    def _clear_track(self):
+        self._gps_track.clear()
+        if HAS_MAP and hasattr(self, "_map_widget"):
+            if self._map_path:
+                self._map_path.delete()
+                self._map_path = None
 
     # ── Input bar ─────────────────────────────────────────────────────────────
     def _build_inputbar(self):
@@ -488,6 +590,11 @@ class SerialGUI:
         self._ax_plot.autoscale_view()
         self._canvas.draw_idle()
         self._schedule_plot()
+
+    def _show_gps_tab(self):
+        if self._nb_frame not in self._pane.panes():
+            self._pane.add(self._nb_frame, stretch="always", width=420)
+        self._notebook.select(self._gps_frame)
 
     # ── Modem graph ───────────────────────────────────────────────────────────
     def _modem_stream_on(self, interval_s: int):
@@ -601,7 +708,28 @@ class SerialGUI:
             self._modem_rsrp.append(int(m.group(2)))
             self._modem_sinr.append(int(m.group(3)))
             self._gps_str = m.group(5).strip()
+            sats = int(m.group(6))
+            if self._gps_str != "no_fix":
+                try:
+                    lat, lon = map(float, self._gps_str.split(","))
+                    self._update_gps_display(lat, lon, sats)
+                except (ValueError, AttributeError):
+                    pass
+            else:
+                self._sats_lbl.config(text="0", fg=RED)
+                self._coords_lbl.config(text="no fix")
             return  # don't print MS lines to console
+
+        m = GNSS_READ_RE.search(text)
+        if m:
+            try:
+                lat  = float(m.group(1))
+                lon  = float(m.group(2))
+                sats = int(m.group(3))
+                self._update_gps_display(lat, lon, sats)
+                self._show_gps_tab()
+            except (ValueError, AttributeError):
+                pass
 
         if text.startswith("OK") and any(s in text for s in
                                           ("IDLE","SLEEP","TEST_RUNNING")):
