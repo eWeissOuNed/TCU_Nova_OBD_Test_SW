@@ -333,6 +333,17 @@ static void handle_line(char *line)
             if (e == ESP_OK) resp_ok(NULL);
             else resp_err(esp_err_to_name(e));
 
+        } else if (strcmp(tok[1], "SMS") == 0 && ntok >= 4) {
+            /* MODEM SMS <number> <text words...> */
+            char text[128] = "";
+            for (int i = 3; i < ntok; i++) {
+                if (i > 3) strncat(text, " ", sizeof(text) - strlen(text) - 1);
+                strncat(text, tok[i], sizeof(text) - strlen(text) - 1);
+            }
+            esp_err_t e = modem_sms_send(tok[2], text);
+            if (e == ESP_OK) resp_ok("sent");
+            else resp_err("SMS failed");
+
         } else if (strcmp(tok[1], "AT") == 0 && ntok >= 3) {
             /* rebuild AT command from remaining tokens */
             char at_cmd[64] = "AT";
@@ -344,8 +355,48 @@ static void handle_line(char *line)
             if (e == ESP_OK) resp_ok(resp);
             else resp_err(esp_err_to_name(e));
 
+        } else if (strcmp(tok[1], "SIGNAL") == 0) {
+            int dbm = 0;
+            char detail[128] = "";
+            esp_err_t e = modem_signal(&dbm, detail, sizeof(detail));
+            if (e == ESP_OK) {
+                char buf[160];
+                snprintf(buf, sizeof(buf), "%d dBm  %s", dbm, detail);
+                resp_ok(buf);
+            } else {
+                resp_err("signal read failed");
+            }
+
+        } else if (strcmp(tok[1], "STREAM") == 0 && ntok >= 3) {
+            if (strcmp(tok[2], "ON") == 0) {
+                uint32_t ms = (ntok >= 4) ? (uint32_t)(atoi(tok[3]) * 1000) : 5000;
+                modem_stream_set(true, ms);
+                resp_ok(NULL);
+            } else {
+                modem_stream_set(false, 0);
+                resp_ok(NULL);
+            }
+
+        } else if (strcmp(tok[1], "GNSS") == 0 && ntok >= 3) {
+            if (strcmp(tok[2], "ON") == 0) {
+                esp_err_t e = modem_gnss_enable(true);
+                if (e == ESP_OK) resp_ok("GNSS enabled");
+                else resp_err(esp_err_to_name(e));
+            } else if (strcmp(tok[2], "OFF") == 0) {
+                esp_err_t e = modem_gnss_enable(false);
+                if (e == ESP_OK) resp_ok("GNSS disabled");
+                else resp_err(esp_err_to_name(e));
+            } else if (strcmp(tok[2], "READ") == 0) {
+                char pos[128];
+                esp_err_t e = modem_gnss_read(pos, sizeof(pos));
+                if (e == ESP_OK) resp_ok(pos);
+                else resp_err(pos);   /* contains "no fix yet" or error msg */
+            } else {
+                resp_err("MODEM GNSS: ON | OFF | READ");
+            }
+
         } else {
-            resp_err("MODEM: POWER ON | POWER OFF | AT <command>");
+            resp_err("MODEM: POWER ON | POWER OFF | SMS <number> <text> | SIGNAL | GNSS <ON|OFF|READ> | AT <command>");
         }
 
     /* ── SLEEP ── */

@@ -9,7 +9,7 @@ import re
 import threading
 import collections
 import tkinter as tk
-from tkinter import ttk, scrolledtext, colorchooser
+from tkinter import ttk, scrolledtext, colorchooser, simpledialog, messagebox
 import serial
 from serial.tools import list_ports
 import matplotlib
@@ -17,8 +17,9 @@ matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-BAUD_DEFAULT = 115200
-IMU_WINDOW   = 200
+BAUD_DEFAULT   = 115200
+IMU_WINDOW     = 200
+MODEM_WINDOW   = 120
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 BG        = "#1e1e1e"
@@ -44,8 +45,13 @@ TAG_COLOURS = {
     "cmd":  "#dcdcaa",
 }
 
+MODEM_RE = re.compile(
+    r"MS rssi=([+-]?\d+) rsrp=([+-]?\d+) sinr=([+-]?\d+) rsrq=([+-]?\d+) gps=(.+)"
+)
+
 IMU_RE = re.compile(
     r"IMU\s+ax=([+-]?\d+\.\d+)\s+g\s+ay=([+-]?\d+\.\d+)\s+g\s+az=([+-]?\d+\.\d+)"
+    r"(?:\s+g\s+gx=([+-]?\d+\.\d+)\s+d/s\s+gy=([+-]?\d+\.\d+)\s+d/s\s+gz=([+-]?\d+\.\d+))?"
 )
 
 
@@ -56,9 +62,9 @@ def styled_btn(parent, text, cmd, bg=BG3, fg=FG, font=FONT_SM, padx=6, pady=2):
                      cursor="hand2")
 
 
-def section_label(parent, text):
-    tk.Label(parent, text=text, bg=BG2, fg=FG_DIM,
-             font=FONT_SM).pack(side=tk.LEFT, padx=(8, 2))
+# ── Simple input dialog ───────────────────────────────────────────────────────
+def ask(title, prompt, initial=""):
+    return simpledialog.askstring(title, prompt, initialvalue=initial)
 
 
 # ── LED colour wheel widget ───────────────────────────────────────────────────
@@ -69,7 +75,7 @@ class LedWheel(tk.Frame):
         self.send_fn = send_fn
         self.colour  = "#000000"
 
-        tk.Label(self, text=f"{idx}", bg=BG2, fg=FG_DIM,
+        tk.Label(self, text=f"LED {idx}", bg=BG2, fg=FG_DIM,
                  font=FONT_SM).pack()
 
         self.canvas = tk.Canvas(self, width=36, height=36, bg=BG2,
@@ -106,7 +112,7 @@ class SerialGUI:
         self.root = root
         self.root.title("TCU NOVA OBD – Serial Console")
         self.root.configure(bg=BG)
-        self.root.geometry("1200x720")
+        self.root.geometry("1100x680")
         self.root.minsize(800, 500)
 
         self.port_obj: serial.Serial | None = None
@@ -120,17 +126,166 @@ class SerialGUI:
         self._imu_active = False
         self._plot_job   = None
 
-        self._build_ui()
-        self._populate_ports()
+        self._modem_rssi: collections.deque = collections.deque(maxlen=MODEM_WINDOW)
+        self._modem_rsrp: collections.deque = collections.deque(maxlen=MODEM_WINDOW)
+        self._modem_sinr: collections.deque = collections.deque(maxlen=MODEM_WINDOW)
+        self._modem_active = False
+        self._modem_plot_job = None
+        self._gps_str = "–"
 
-    # ── UI ────────────────────────────────────────────────────────────────────
-    def _build_ui(self):
+        self._build_menubar()
         self._build_topbar()
-        self._build_toolbar()
         self._build_led_panel()
         self._build_main()
         self._build_inputbar()
+        self._populate_ports()
 
+    # ── Menubar ───────────────────────────────────────────────────────────────
+    def _build_menubar(self):
+        mb = tk.Menu(self.root, bg=BG2, fg=FG, activebackground=ACCENT,
+                     activeforeground="white", relief=tk.FLAT,
+                     bd=0, tearoff=False)
+        self.root.config(menu=mb)
+
+        # ── System ──
+        m = tk.Menu(mb, bg=BG2, fg=FG, activebackground=ACCENT,
+                    activeforeground="white", tearoff=False)
+        mb.add_cascade(label="System", menu=m)
+        m.add_command(label="Ping",          command=lambda: self._send("PING"))
+        m.add_command(label="Help",          command=lambda: self._send("HELP"))
+        m.add_command(label="State?",        command=lambda: self._send("STATE?"))
+        m.add_separator()
+        m.add_command(label="→ Idle",        command=lambda: self._send("STATE SET IDLE"))
+        m.add_command(label="→ Test Running",command=lambda: self._send("STATE SET TEST_RUNNING"))
+        m.add_command(label="→ Sleep",       command=lambda: self._send("STATE SET SLEEP"))
+        m.add_separator()
+        m.add_command(label="Sleep now",     command=lambda: self._send("SLEEP"))
+
+        # ── IMU ──
+        m = tk.Menu(mb, bg=BG2, fg=FG, activebackground=ACCENT,
+                    activeforeground="white", tearoff=False)
+        mb.add_cascade(label="IMU", menu=m)
+        m.add_command(label="Read",          command=lambda: self._send("IMU?"))
+        m.add_separator()
+        m.add_command(label="Stream ON",     command=lambda: self._send("IMU STREAM ON"))
+        m.add_command(label="Stream OFF",    command=lambda: self._send("IMU STREAM OFF"))
+
+        # ── CAN ──
+        m = tk.Menu(mb, bg=BG2, fg=FG, activebackground=ACCENT,
+                    activeforeground="white", tearoff=False)
+        mb.add_cascade(label="CAN", menu=m)
+        m.add_command(label="RX Stream ON",  command=lambda: self._send("CAN STREAM ON"))
+        m.add_command(label="RX Stream OFF", command=lambda: self._send("CAN STREAM OFF"))
+        m.add_separator()
+        m.add_command(label="Send frame…",   command=self._dlg_can_send)
+
+        # ── SD Card ──
+        m = tk.Menu(mb, bg=BG2, fg=FG, activebackground=ACCENT,
+                    activeforeground="white", tearoff=False)
+        mb.add_cascade(label="SD Card", menu=m)
+        m.add_command(label="Detect",        command=lambda: self._send("SD DET"))
+        m.add_command(label="Init / Mount",  command=lambda: self._send("SD INIT"))
+        m.add_command(label="List files",    command=lambda: self._send("SD LIST"))
+        m.add_command(label="Read TEST.TXT", command=lambda: self._send("SD READ"))
+        m.add_command(label="Write line…",   command=self._dlg_sd_write)
+        m.add_command(label="Wipe TEST.TXT", command=self._dlg_sd_wipe)
+        m.add_separator()
+        m.add_command(label="Enable card",   command=lambda: self._send("SD EN ON"))
+        m.add_command(label="Disable card",  command=lambda: self._send("SD EN OFF"))
+
+        # ── GPIO ──
+        m = tk.Menu(mb, bg=BG2, fg=FG, activebackground=ACCENT,
+                    activeforeground="white", tearoff=False)
+        mb.add_cascade(label="GPIO", menu=m)
+        m.add_command(label="Set pin…",      command=self._dlg_gpio_set)
+        m.add_command(label="Get pin…",      command=self._dlg_gpio_get)
+        m.add_command(label="Toggle pin…",   command=self._dlg_gpio_toggle)
+        m.add_separator()
+        m.add_command(label="Stop all toggles", command=lambda: self._send("GPIO STOP ALL"))
+
+        # ── UWB ──
+        m = tk.Menu(mb, bg=BG2, fg=FG, activebackground=ACCENT,
+                    activeforeground="white", tearoff=False)
+        mb.add_cascade(label="UWB", menu=m)
+        m.add_command(label="Init",          command=lambda: self._send("UWB INIT"))
+        m.add_command(label="Read Device ID",command=lambda: self._send("UWB READ ID"))
+        m.add_command(label="Range",         command=lambda: self._send("UWB RANGE"))
+
+        # ── Modem ──
+        m = tk.Menu(mb, bg=BG2, fg=FG, activebackground=ACCENT,
+                    activeforeground="white", tearoff=False)
+        mb.add_cascade(label="Modem", menu=m)
+        m.add_command(label="Power ON",        command=lambda: self._send("MODEM POWER ON"))
+        m.add_command(label="Power OFF",       command=lambda: self._send("MODEM POWER OFF"))
+        m.add_separator()
+        m.add_command(label="Signal strength", command=lambda: self._send("MODEM SIGNAL"))
+        m.add_command(label="Stream ON (5s)",  command=lambda: self._modem_stream_on(5))
+        m.add_command(label="Stream ON (10s)", command=lambda: self._modem_stream_on(10))
+        m.add_command(label="Stream OFF",      command=self._modem_stream_off)
+        m.add_separator()
+        m.add_command(label="GNSS ON",         command=lambda: self._send("MODEM GNSS ON"))
+        m.add_command(label="GNSS Read",       command=lambda: self._send("MODEM GNSS READ"))
+        m.add_command(label="GNSS OFF",        command=lambda: self._send("MODEM GNSS OFF"))
+        m.add_separator()
+        m.add_command(label="Send SMS…",       command=self._dlg_sms)
+        m.add_command(label="AT command…",     command=self._dlg_at)
+
+        # ── View ──
+        m = tk.Menu(mb, bg=BG2, fg=FG, activebackground=ACCENT,
+                    activeforeground="white", tearoff=False)
+        mb.add_cascade(label="View", menu=m)
+        m.add_command(label="Clear console", command=self._clear_output)
+        m.add_separator()
+        m.add_command(label="IMU graph ON",  command=self._show_graph)
+        m.add_command(label="IMU graph OFF", command=self._hide_graph)
+
+    # ── Dialogs ───────────────────────────────────────────────────────────────
+    def _dlg_can_send(self):
+        id_hex = ask("CAN Send", "CAN ID (hex):", "001")
+        if not id_hex: return
+        data_hex = ask("CAN Send", "Data bytes (hex, space-separated):", "00 00")
+        if data_hex is None: return
+        self._send(f"CAN SEND {id_hex} {data_hex}")
+
+    def _dlg_sd_write(self):
+        msg = ask("SD Write", "Message to write:")
+        if msg: self._send(f"SD WRITE {msg}")
+
+    def _dlg_sd_wipe(self):
+        if messagebox.askyesno("SD Wipe", "Delete TEST.TXT?"):
+            self._send("SD WIPE")
+
+    def _dlg_gpio_set(self):
+        pin = ask("GPIO Set", "Pin number:")
+        if not pin: return
+        level = ask("GPIO Set", "Level (HIGH / LOW):", "HIGH")
+        if level: self._send(f"GPIO SET {pin} {level.upper()}")
+
+    def _dlg_gpio_get(self):
+        pin = ask("GPIO Get", "Pin number:")
+        if pin: self._send(f"GPIO GET {pin}")
+
+    def _dlg_gpio_toggle(self):
+        pin = ask("GPIO Toggle", "Pin number:")
+        if not pin: return
+        freq = ask("GPIO Toggle", "Frequency Hz (blank = STOP):", "1")
+        if freq is None: return
+        if freq.strip() == "":
+            self._send(f"GPIO TOGGLE {pin} STOP")
+        else:
+            self._send(f"GPIO TOGGLE {pin} {freq}")
+
+    def _dlg_sms(self):
+        number = ask("Send SMS", "Phone number (e.g. +41793640605):", "+")
+        if not number: return
+        text = ask("Send SMS", "Message text:")
+        if text: self._send(f"MODEM SMS {number} {text}")
+
+    def _dlg_at(self):
+        cmd = ask("AT Command", "AT command (without leading AT):", "+CREG?")
+        if cmd: self._send(f"MODEM AT {cmd}")
+
+    # ── Top bar (connection) ──────────────────────────────────────────────────
     def _build_topbar(self):
         bar = tk.Frame(self.root, bg=BG, pady=5)
         bar.pack(fill=tk.X, padx=8)
@@ -154,7 +309,16 @@ class SerialGUI:
         styled_btn(bar, "↻", self._populate_ports, padx=6
                    ).pack(side=tk.LEFT, padx=4)
 
-        # right side
+        # quick buttons
+        tk.Frame(bar, bg="#444", width=1).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
+        styled_btn(bar, "Ping",   lambda: self._send("PING"), padx=8
+                   ).pack(side=tk.LEFT, padx=2)
+        styled_btn(bar, "Help",   lambda: self._send("HELP"), padx=8
+                   ).pack(side=tk.LEFT, padx=2)
+        styled_btn(bar, "Clear",  self._clear_output, padx=8
+                   ).pack(side=tk.LEFT, padx=2)
+
+        # right side status
         self.status_lbl = tk.Label(bar, text="● Disconnected",
                                    bg=BG, fg="#f44747", font=FONT)
         self.status_lbl.pack(side=tk.RIGHT, padx=8)
@@ -171,72 +335,7 @@ class SerialGUI:
                                    font=FONT_BOLD, width=14, anchor="w")
         self.state_lbl.pack(side=tk.RIGHT, padx=(0, 4))
 
-    def _build_toolbar(self):
-        bar = tk.Frame(self.root, bg=BG2, pady=4)
-        bar.pack(fill=tk.X, padx=0)
-
-        # ── System ──
-        section_label(bar, "SYSTEM")
-        for lbl, cmd in [("Ping", "PING"), ("Help", "HELP"),
-                          ("State?", "STATE?")]:
-            styled_btn(bar, lbl, lambda c=cmd: self._send(c)
-                       ).pack(side=tk.LEFT, padx=2)
-
-        for lbl, state in [("→ Idle", "IDLE"), ("→ Sleep", "SLEEP"),
-                             ("→ Test", "TEST_RUNNING")]:
-            styled_btn(bar, lbl,
-                       lambda s=state: self._send(f"STATE SET {s}"),
-                       bg="#3a3a3a").pack(side=tk.LEFT, padx=2)
-
-        tk.Frame(bar, bg="#444", width=1).pack(side=tk.LEFT,
-                                               fill=tk.Y, padx=6, pady=2)
-
-        # ── IMU ──
-        section_label(bar, "IMU")
-        for lbl, cmd in [("Read", "IMU?"), ("Stream ON", "IMU STREAM ON"),
-                          ("Stream OFF", "IMU STREAM OFF")]:
-            styled_btn(bar, lbl, lambda c=cmd: self._send(c)
-                       ).pack(side=tk.LEFT, padx=2)
-
-        tk.Frame(bar, bg="#444", width=1).pack(side=tk.LEFT,
-                                               fill=tk.Y, padx=6, pady=2)
-
-        # ── CAN ──
-        section_label(bar, "CAN")
-        for lbl, cmd in [("RX ON", "CAN STREAM ON"),
-                          ("RX OFF", "CAN STREAM OFF")]:
-            styled_btn(bar, lbl, lambda c=cmd: self._send(c)
-                       ).pack(side=tk.LEFT, padx=2)
-
-        tk.Frame(bar, bg="#444", width=1).pack(side=tk.LEFT,
-                                               fill=tk.Y, padx=6, pady=2)
-
-        # ── SD ──
-        section_label(bar, "SD CARD")
-        for lbl, cmd in [("Init",   "SD INIT"),
-                          ("List",   "SD LIST"),
-                          ("Read",   "SD READ"),
-                          ("Wipe",   "SD WIPE"),
-                          ("EN ON",  "SD EN ON"),
-                          ("EN OFF", "SD EN OFF")]:
-            styled_btn(bar, lbl, lambda c=cmd: self._send(c)
-                       ).pack(side=tk.LEFT, padx=2)
-
-        tk.Frame(bar, bg="#444", width=1).pack(side=tk.LEFT,
-                                               fill=tk.Y, padx=6, pady=2)
-
-        # ── LED quick ──
-        section_label(bar, "LED")
-        styled_btn(bar, "All OFF", lambda: self._send("LED OFF"),
-                   bg="#5a2a2a", fg="#ffaaaa").pack(side=tk.LEFT, padx=2)
-
-        for i, (r, g, b) in enumerate([(255,255,255),(255,0,0),(0,255,0),(0,0,255)]):
-            label = ["White","Red","Green","Blue"][i]
-            styled_btn(bar, label,
-                       lambda c=f"LED OFF\nLED 0 {r} {g} {b}\nLED 1 {r} {g} {b}\nLED 2 {r} {g} {b}":
-                           [self._send(l) for l in c.split("\n")]
-                       ).pack(side=tk.LEFT, padx=2)
-
+    # ── LED panel ─────────────────────────────────────────────────────────────
     def _build_led_panel(self):
         panel = tk.Frame(self.root, bg=BG2, pady=4)
         panel.pack(fill=tk.X, padx=0, pady=(1, 0))
@@ -255,6 +354,19 @@ class SerialGUI:
         styled_btn(panel, "All OFF", lambda: self._send("LED OFF"),
                    bg="#5a2a2a", fg="#ffaaaa").pack(side=tk.LEFT, padx=4)
 
+        # preset colours
+        tk.Frame(panel, bg="#444", width=1).pack(side=tk.LEFT,
+                                                  fill=tk.Y, padx=8, pady=4)
+        tk.Label(panel, text="Presets:", bg=BG2, fg=FG_DIM,
+                 font=FONT_SM).pack(side=tk.LEFT, padx=(0, 4))
+        for label, r, g, b in [("White",255,255,255),("Red",255,0,0),
+                                 ("Green",0,255,0),("Blue",0,0,255)]:
+            styled_btn(panel, label,
+                       lambda r=r,g=g,b=b: [
+                           self._send(f"LED {i} {r} {g} {b}") for i in range(3)
+                       ]).pack(side=tk.LEFT, padx=2)
+
+    # ── Main pane ─────────────────────────────────────────────────────────────
     def _build_main(self):
         self._pane = tk.PanedWindow(self.root, orient=tk.HORIZONTAL,
                                     bg=BG, sashwidth=5, sashrelief=tk.FLAT)
@@ -269,10 +381,20 @@ class SerialGUI:
         for tag, colour in TAG_COLOURS.items():
             self.output.tag_config(tag, foreground=colour)
 
-        self.graph_frame = tk.Frame(self._pane, bg=PLOT_BG)
-        self._build_graph(self.graph_frame)
+        # Right panel: notebook with IMU and Modem tabs
+        self._nb_frame = tk.Frame(self._pane, bg=BG2)
+        self._notebook = ttk.Notebook(self._nb_frame)
+        self._notebook.pack(fill=tk.BOTH, expand=True)
 
-    def _build_graph(self, parent):
+        self.graph_frame = tk.Frame(self._notebook, bg=PLOT_BG)
+        self._notebook.add(self.graph_frame, text=" IMU ")
+        self._build_imu_graph(self.graph_frame)
+
+        self._modem_frame = tk.Frame(self._notebook, bg=PLOT_BG)
+        self._notebook.add(self._modem_frame, text=" Modem ")
+        self._build_modem_graph(self._modem_frame)
+
+    def _build_imu_graph(self, parent):
         fig = Figure(figsize=(4, 3), dpi=90, facecolor=PLOT_BG)
         self._ax_plot = fig.add_subplot(111, facecolor=PLOT_BG)
         ax = self._ax_plot
@@ -291,6 +413,31 @@ class SerialGUI:
         self._canvas = FigureCanvasTkAgg(fig, master=parent)
         self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
+    def _build_modem_graph(self, parent):
+        fig = Figure(figsize=(4, 3), dpi=90, facecolor=PLOT_BG)
+        self._modem_ax = fig.add_subplot(111, facecolor=PLOT_BG)
+        ax = self._modem_ax
+        ax.tick_params(colors=FG, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#444")
+        ax.set_title("Signal Strength", color=FG, fontsize=9)
+        ax.set_ylabel("dBm", color=FG, fontsize=8)
+        ax.set_xlabel("samples", color=FG, fontsize=8)
+        self._line_rssi, = ax.plot([], [], color="#4fc1ff", lw=1.2, label="RSSI")
+        self._line_rsrp, = ax.plot([], [], color="#ce9178", lw=1.2, label="RSRP")
+        self._line_sinr, = ax.plot([], [], color="#4ec94e", lw=1.2, label="SINR×2")
+        ax.legend(fontsize=8, loc="upper right",
+                  facecolor=BG3, edgecolor="#444", labelcolor=FG)
+        fig.tight_layout(pad=1.2)
+        self._modem_canvas = FigureCanvasTkAgg(fig, master=parent)
+        self._modem_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # GPS label below graph
+        self._gps_label = tk.Label(parent, text="GPS: –", bg=BG2, fg=FG_DIM,
+                                    font=FONT_SM, anchor="w")
+        self._gps_label.pack(fill=tk.X, padx=6, pady=(0, 4))
+
+    # ── Input bar ─────────────────────────────────────────────────────────────
     def _build_inputbar(self):
         bar = tk.Frame(self.root, bg=BG, pady=6)
         bar.pack(fill=tk.X, padx=8)
@@ -310,13 +457,12 @@ class SerialGUI:
 
         styled_btn(bar, "Send", self._on_enter, bg=ACCENT, fg="white",
                    padx=12, pady=3).pack(side=tk.LEFT)
-        styled_btn(bar, "Clear", self._clear_output,
-                   padx=8).pack(side=tk.LEFT, padx=(4, 0))
 
     # ── IMU graph ─────────────────────────────────────────────────────────────
     def _show_graph(self):
-        if self.graph_frame not in self._pane.panes():
-            self._pane.add(self.graph_frame, stretch="always", width=400)
+        if self._nb_frame not in self._pane.panes():
+            self._pane.add(self._nb_frame, stretch="always", width=420)
+        self._notebook.select(self.graph_frame)
         self._imu_active = True
         self._schedule_plot()
 
@@ -325,8 +471,8 @@ class SerialGUI:
         if self._plot_job:
             self.root.after_cancel(self._plot_job)
             self._plot_job = None
-        if self.graph_frame in self._pane.panes():
-            self._pane.remove(self.graph_frame)
+        if not self._modem_active and self._nb_frame in self._pane.panes():
+            self._pane.remove(self._nb_frame)
 
     def _schedule_plot(self):
         self._plot_job = self.root.after(100, self._update_plot)
@@ -343,7 +489,43 @@ class SerialGUI:
         self._canvas.draw_idle()
         self._schedule_plot()
 
-    # ── serial ────────────────────────────────────────────────────────────────
+    # ── Modem graph ───────────────────────────────────────────────────────────
+    def _modem_stream_on(self, interval_s: int):
+        self._send(f"MODEM STREAM ON {interval_s}")
+        if self._nb_frame not in self._pane.panes():
+            self._pane.add(self._nb_frame, stretch="always", width=420)
+        self._notebook.select(self._modem_frame)
+        self._modem_active = True
+        self._schedule_modem_plot()
+
+    def _modem_stream_off(self):
+        self._send("MODEM STREAM OFF")
+        self._modem_active = False
+        if self._modem_plot_job:
+            self.root.after_cancel(self._modem_plot_job)
+            self._modem_plot_job = None
+        if not self._imu_active and self._nb_frame in self._pane.panes():
+            self._pane.remove(self._nb_frame)
+
+    def _schedule_modem_plot(self):
+        self._modem_plot_job = self.root.after(500, self._update_modem_plot)
+
+    def _update_modem_plot(self):
+        if not self._modem_active:
+            return
+        xs = list(range(len(self._modem_rssi)))
+        self._line_rssi.set_data(xs, list(self._modem_rssi))
+        self._line_rsrp.set_data(xs, list(self._modem_rsrp))
+        # SINR is in 0.2 dB units from modem; scale to dB for display
+        sinr_db = [v * 0.2 for v in self._modem_sinr]
+        self._line_sinr.set_data(xs, sinr_db)
+        self._modem_ax.relim()
+        self._modem_ax.autoscale_view()
+        self._modem_canvas.draw_idle()
+        self._gps_label.config(text=f"GPS: {self._gps_str}")
+        self._schedule_modem_plot()
+
+    # ── Serial ────────────────────────────────────────────────────────────────
     def _populate_ports(self):
         ports = [p.device for p in list_ports.comports()]
         self.port_cb["values"] = ports
@@ -376,6 +558,7 @@ class SerialGUI:
             self.port_obj.close()
             self.port_obj = None
         self._hide_graph()
+        self._modem_stream_off()
         self.connect_btn.config(text="Connect", bg=ACCENT)
         self.status_lbl.config(text="● Disconnected", fg="#f44747")
         self.state_lbl.config(text="–")
@@ -398,13 +581,11 @@ class SerialGUI:
                         self.root.after(0, self._append_line, text)
 
     def _append_line(self, text: str):
-        # heartbeat → status label
         if text.startswith("HB"):
             parts = text.split()
             self.hb_lbl.config(text=parts[-1] if parts else "?", fg=GREEN)
             return
 
-        # IMU → graph buffers
         m = IMU_RE.search(text)
         if m:
             self._imu_ax.append(float(m.group(1)))
@@ -414,17 +595,21 @@ class SerialGUI:
                 self._append(text + "\n", "imu")
             return
 
-        # state change → state label
+        m = MODEM_RE.search(text)
+        if m:
+            self._modem_rssi.append(int(m.group(1)))
+            self._modem_rsrp.append(int(m.group(2)))
+            self._modem_sinr.append(int(m.group(3)))
+            self._gps_str = m.group(5).strip()
+            return  # don't print MS lines to console
+
         if text.startswith("OK") and any(s in text for s in
                                           ("IDLE","SLEEP","TEST_RUNNING")):
-            state = text.replace("OK", "").strip()
-            self.state_lbl.config(text=state)
+            self.state_lbl.config(text=text.replace("OK", "").strip())
 
-        # IMU stream toggle → graph show/hide
         if "streaming ON"  in text: self._show_graph()
         if "streaming OFF" in text: self._hide_graph()
 
-        # colour-coded console output
         if text.startswith("OK"):      tag = "ok"
         elif text.startswith("ERR"):   tag = "err"
         elif text.startswith("STD") or text.startswith("EXT"): tag = "can"
@@ -433,7 +618,7 @@ class SerialGUI:
         else:                          tag = None
         self._append(text + "\n", tag)
 
-    # ── output ────────────────────────────────────────────────────────────────
+    # ── Output ────────────────────────────────────────────────────────────────
     def _append(self, text: str, tag: str | None = None):
         self.output.config(state=tk.NORMAL)
         if tag:
@@ -448,7 +633,7 @@ class SerialGUI:
         self.output.delete("1.0", tk.END)
         self.output.config(state=tk.DISABLED)
 
-    # ── input ─────────────────────────────────────────────────────────────────
+    # ── Input ─────────────────────────────────────────────────────────────────
     def _on_enter(self, _=None):
         cmd = self.input_var.get().strip()
         if not cmd:
@@ -486,7 +671,7 @@ class SerialGUI:
             self.input_var.set("")
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     root = tk.Tk()
     app  = SerialGUI(root)

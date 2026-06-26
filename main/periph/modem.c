@@ -14,6 +14,7 @@
 #include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include <string.h>
 #include <stdio.h>
@@ -21,8 +22,12 @@
 
 static const char *TAG = "MODEM";
 
-static bool s_init = false;
-static bool s_on   = false;
+static bool               s_init        = false;
+static bool               s_on          = false;
+static SemaphoreHandle_t  s_uart_mtx    = NULL;
+static TaskHandle_t       s_stream_task = NULL;
+static volatile bool      s_stream_run  = false;
+static uint32_t           s_stream_ms   = 5000;
 
 /* ── PWRKEY helpers ──────────────────────────────────────────────────────── */
 
@@ -123,6 +128,7 @@ esp_err_t modem_init(void)
         return ret;
     }
 
+    s_uart_mtx = xSemaphoreCreateMutex();
     s_init = true;
     ESP_LOGI(TAG, "init OK  PWRKEY=GPIO%d  TX=GPIO%d  RX=GPIO%d",
              CFG_MODEM_PWRKEY, CFG_MODEM_TX, CFG_MODEM_RX);
@@ -149,13 +155,17 @@ esp_err_t modem_power_on(uint32_t timeout_ms)
         ESP_LOGE(TAG, "power_on: modem not initialised");
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_on) {
-        ESP_LOGW(TAG, "already on");
+
+    /* Check if modem is already responsive before pulsing PWRKEY.
+     * If we pulse when it's already on, we'd turn it off instead. */
+    uart_flush(CFG_MODEM_UART);
+    uart_write_bytes(CFG_MODEM_UART, "AT\r\n", 4);
+    char probe[32];
+    if (uart_wait_for("OK", 1000, probe, sizeof(probe)) == ESP_OK) {
+        ESP_LOGI(TAG, "modem already on");
+        s_on = true;
         return ESP_OK;
     }
-
-    /* Flush any stale RX bytes */
-    uart_flush(CFG_MODEM_UART);
 
     pwrkey_pulse();
 
@@ -181,6 +191,140 @@ esp_err_t modem_power_off(void)
     return ESP_OK;
 }
 
+esp_err_t modem_sms_send(const char *number, const char *text)
+{
+    if (!s_init) return ESP_ERR_INVALID_STATE;
+    if (!s_on)  { ESP_LOGW(TAG, "SMS ignored – modem is off"); return ESP_ERR_INVALID_STATE; }
+
+    char buf[128];
+    esp_err_t ret;
+
+    /* 1. Set text mode */
+    uart_write_bytes(CFG_MODEM_UART, "AT+CMGF=1\r\n", 11);
+    ret = uart_wait_for("OK", 3000, buf, sizeof(buf));
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "CMGF failed"); return ESP_FAIL; }
+
+    /* 2. Start SMS – wait for '>' prompt */
+    int n = snprintf(buf, sizeof(buf), "AT+CMGS=\"%s\"\r\n", number);
+    uart_write_bytes(CFG_MODEM_UART, buf, n);
+    ret = uart_wait_for(">", 5000, buf, sizeof(buf));
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "no '>' prompt"); return ESP_FAIL; }
+
+    /* 3. Send message text + Ctrl-Z (0x1A) */
+    uart_write_bytes(CFG_MODEM_UART, text, strlen(text));
+    uart_write_bytes(CFG_MODEM_UART, "\x1A", 1);
+
+    /* 4. Wait for +CMGS confirmation (up to 30 s) */
+    ret = uart_wait_for("+CMGS:", 30000, buf, sizeof(buf));
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "SMS send timeout"); return ESP_FAIL; }
+
+    ESP_LOGI(TAG, "SMS sent to %s", number);
+    return ESP_OK;
+}
+
+esp_err_t modem_signal(int *rssi_dbm, char *detail_buf, size_t detail_len)
+{
+    if (!s_init || !s_on) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_uart_mtx, pdMS_TO_TICKS(3000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    char buf[128];
+
+    /* AT+CSQ → +CSQ: <rssi>,<ber>  rssi 0-31 → -113…-51 dBm, 99=unknown */
+    uart_write_bytes(CFG_MODEM_UART, "AT+CSQ\r\n", 8);
+    if (uart_wait_for("OK", 3000, buf, sizeof(buf)) == ESP_OK) {
+        int rssi_raw = 99, ber = 0;
+        char *p = strstr(buf, "+CSQ:");
+        if (p) sscanf(p, "+CSQ: %d,%d", &rssi_raw, &ber);
+        if (rssi_dbm) {
+            *rssi_dbm = (rssi_raw == 99) ? 0 : (-113 + rssi_raw * 2);
+        }
+    } else {
+        xSemaphoreGive(s_uart_mtx);
+        return ESP_FAIL;
+    }
+
+    /* AT+QCSQ → detailed LTE signal (RSRP, RSRQ, SINR) */
+    if (detail_buf && detail_len > 0) {
+        uart_write_bytes(CFG_MODEM_UART, "AT+QCSQ\r\n", 9);
+        if (uart_wait_for("OK", 3000, buf, sizeof(buf)) == ESP_OK) {
+            char *p = strstr(buf, "+QCSQ:");
+            if (p) {
+                while (*p && (*p == '\r' || *p == '\n')) p++;
+                strncpy(detail_buf, p, detail_len - 1);
+                detail_buf[detail_len - 1] = '\0';
+            }
+        }
+    }
+
+    xSemaphoreGive(s_uart_mtx);
+    return ESP_OK;
+}
+
+esp_err_t modem_gnss_enable(bool on)
+{
+    if (!s_init || !s_on) return ESP_ERR_INVALID_STATE;
+
+    char buf[64];
+    if (on) {
+        uart_write_bytes(CFG_MODEM_UART, "AT+QGPS=1\r\n", 11);
+    } else {
+        uart_write_bytes(CFG_MODEM_UART, "AT+QGPSEND\r\n", 12);
+    }
+    esp_err_t ret = uart_wait_for("OK", 3000, buf, sizeof(buf));
+    if (ret != ESP_OK) {
+        /* ERROR is normal if GNSS is already in the requested state */
+        ESP_LOGW(TAG, "GNSS %s: no OK (may already be in that state)", on ? "ON" : "OFF");
+    }
+    return ESP_OK;
+}
+
+esp_err_t modem_gnss_read(char *out_buf, size_t out_len)
+{
+    if (!s_init || !s_on) return ESP_ERR_INVALID_STATE;
+    if (!out_buf || out_len == 0) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(s_uart_mtx, pdMS_TO_TICKS(6000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    char buf[256];
+    /* Format 2 = decimal degrees: +QGPSLOC: <utc>,<lat>,<lon>,<hdop>,<alt>,... */
+    uart_write_bytes(CFG_MODEM_UART, "AT+QGPSLOC=2\r\n", 14);
+    /* Wait for either OK or ERROR – whichever comes first */
+    esp_err_t ret = uart_wait_for("OK", 5000, buf, sizeof(buf));
+    if (ret != ESP_OK) {
+        /* Re-read any pending bytes to catch the CME ERROR response */
+        uart_read_bytes(CFG_MODEM_UART, (uint8_t *)(buf + strlen(buf)),
+                        sizeof(buf) - strlen(buf) - 1, pdMS_TO_TICKS(500));
+        /* +CME ERROR: 516 = not fixed yet, 505 = GNSS not enabled */
+        if (strstr(buf, "516")) {
+            strncpy(out_buf, "no fix yet – needs sky view", out_len - 1);
+        } else if (strstr(buf, "505")) {
+            strncpy(out_buf, "GNSS not enabled – run MODEM GNSS ON first", out_len - 1);
+        } else {
+            strncpy(out_buf, "GNSS read failed", out_len - 1);
+        }
+        out_buf[out_len - 1] = '\0';
+        xSemaphoreGive(s_uart_mtx);
+        return ESP_FAIL;
+    }
+
+    char *p = strstr(buf, "+QGPSLOC:");
+    if (!p) {
+        strncpy(out_buf, "parse error", out_len - 1);
+        xSemaphoreGive(s_uart_mtx);
+        return ESP_FAIL;
+    }
+
+    char utc[16], lat[16], lon[16], alt[12];
+    if (sscanf(p, "+QGPSLOC: %15[^,],%15[^,],%15[^,],%*[^,],%11[^,\r\n]",
+               utc, lat, lon, alt) >= 3) {
+        snprintf(out_buf, out_len, "lat=%s lon=%s alt=%sm utc=%s", lat, lon, alt, utc);
+    } else {
+        strncpy(out_buf, p, out_len - 1);
+        out_buf[out_len - 1] = '\0';
+    }
+    xSemaphoreGive(s_uart_mtx);
+    return ESP_OK;
+}
+
 esp_err_t modem_at(const char *cmd, char *resp_buf, size_t buf_len,
                    uint32_t timeout_ms)
 {
@@ -189,6 +333,8 @@ esp_err_t modem_at(const char *cmd, char *resp_buf, size_t buf_len,
         ESP_LOGW(TAG, "AT command ignored – modem is off");
         return ESP_ERR_INVALID_STATE;
     }
+    if (xSemaphoreTake(s_uart_mtx, pdMS_TO_TICKS(timeout_ms + 1000)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
 
     /* Send command + CRLF */
     char line[128];
@@ -199,8 +345,69 @@ esp_err_t modem_at(const char *cmd, char *resp_buf, size_t buf_len,
     /* Wait for OK or ERROR */
     esp_err_t ret = uart_wait_for("OK", timeout_ms, resp_buf, buf_len);
     if (ret != ESP_OK) {
-        uart_wait_for("ERROR", 200, resp_buf, buf_len);   /* short retry */
+        uart_wait_for("ERROR", 200, resp_buf, buf_len);
+        xSemaphoreGive(s_uart_mtx);
         return ESP_FAIL;
+    }
+    xSemaphoreGive(s_uart_mtx);
+    return ESP_OK;
+}
+
+/* ── Periodic stream task ────────────────────────────────────────────────── */
+
+static void modem_stream_task(void *arg)
+{
+    while (s_stream_run) {
+        if (s_on) {
+            int  rssi = 0, rsrp = 0, sinr = 0, rsrq = 0;
+            char detail[128] = "";
+            char gps_str[32] = "no_fix";
+
+            /* Signal */
+            if (modem_signal(&rssi, detail, sizeof(detail)) == ESP_OK) {
+                /* +QCSQ: "LTE",<rssi_raw>,<rsrp>,<sinr>,<rsrq> */
+                char *p = strstr(detail, "LTE");
+                if (p) {
+                    int dummy;
+                    sscanf(p, "LTE\",%d,%d,%d,%d", &dummy, &rsrp, &sinr, &rsrq);
+                }
+            }
+
+            /* GPS – skip gracefully if no fix */
+            char pos[96];
+            if (modem_gnss_read(pos, sizeof(pos)) == ESP_OK) {
+                float lat = 0.0f, lon = 0.0f;
+                if (sscanf(pos, "lat=%f lon=%f", &lat, &lon) == 2)
+                    snprintf(gps_str, sizeof(gps_str), "%.6f,%.6f", lat, lon);
+            }
+
+            printf("MS rssi=%d rsrp=%d sinr=%d rsrq=%d gps=%s\n",
+                   rssi, rsrp, sinr, rsrq, gps_str);
+            fflush(stdout);
+        }
+
+        /* Interruptible sleep – checks s_stream_run every 100 ms */
+        for (uint32_t i = 0; i < s_stream_ms / 100 && s_stream_run; i++)
+            vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    s_stream_task = NULL;
+    vTaskDelete(NULL);
+}
+
+esp_err_t modem_stream_set(bool on, uint32_t interval_ms)
+{
+    if (!s_init) return ESP_ERR_INVALID_STATE;
+
+    if (on) {
+        s_stream_ms  = (interval_ms < 1000) ? 1000 : interval_ms;
+        s_stream_run = true;
+        if (!s_stream_task)
+            xTaskCreate(modem_stream_task, "modem_stream", 4096, NULL, 3, &s_stream_task);
+        ESP_LOGI(TAG, "stream ON  interval=%"PRIu32" ms", s_stream_ms);
+    } else {
+        s_stream_run = false;
+        ESP_LOGI(TAG, "stream OFF");
     }
     return ESP_OK;
 }
